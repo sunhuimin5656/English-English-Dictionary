@@ -11,10 +11,10 @@
 #include <time.h>
 
 
-//¸Ä½øµã
-//´«ÊäÓÃ½á¹¹Ìå
-//¿Í»§¶Ë ÖÕ¶Ë¶ÁÈ¡ĞÎÊ½Ï¸»¯
-//º¯ÊıÖ¸Õë£¬Ö´ĞĞº¯Êı
+//æ”¹è¿›ç‚¹
+//ä¼ è¾“ç”¨ç»“æ„ä½“
+//å®¢æˆ·ç«¯ ç»ˆç«¯è¯»å–å½¢å¼ç»†åŒ–
+//å‡½æ•°æŒ‡é’ˆï¼Œæ‰§è¡Œå‡½æ•°
 
 
 typedef struct{
@@ -41,35 +41,86 @@ int step_history(data_t *data);
 int step_quit(data_t *data);
 
 typedef int (*step_ptr)(data_t*);
+void client_process(int fd,void *d);
+void accept_process(int fd,void *d);
+
+typedef void (*proc_ptr_def)(int fd,void *d);
+#define IO_BUF_LEN 1024
+typedef struct{
+	int maxfds;
+	proc_ptr_def proc_ptr[IO_BUF_LEN];
+	fd_set rfds;
+
+}io_val_t;
 
 int main(){
-	int fd,cfd;
+	int fd,cfd,ret,maxfds;
+	int fdsbuf[IO_BUF_LEN] = {0};
+	fd_set _rfds;
+	io_val_t io_val;
+
 	database_create();
 	if((fd = get_sockfd("127.0.0.1",8000)) < 0)return -1;
-	struct sockaddr_in cli_addr;
-	int addrlen = sizeof(struct sockaddr_in);
-	data_t data;
-	memset(&data,0,sizeof(data_t));
-	step_ptr steplist[6] = {step_register,step_login,step_cancel,step_dictory,step_history,step_quit};
+	io_val.maxfds = fd+1;
+	io_val.proc_ptr[fd] = accept_process;
+	FD_ZERO(&io_val.rfds);
+	FD_SET(fd,&io_val.rfds);
 	while(1){
-		if((cfd = accept(fd,(struct sockaddr *)&cli_addr,&addrlen)) < 0){
-			perror("accept error");
+		memcpy(&_rfds,&io_val.rfds,sizeof(fd_set));
+		ret = select(io_val.maxfds,&_rfds,NULL,NULL,NULL);
+		if(ret <= 0){
+			perror("select error");
 			exit(-1);
 		}
-		printf("client connect info : %s  %d\n",inet_ntoa(cli_addr.sin_addr),ntohs(cli_addr.sin_port));
-		while(1){
-			if(recv_data(cfd,&data,sizeof(data_t)) < 0)break;
-			int num = confirm_cmd(data.cmd);
-			if(num < 0 || num >= sizeof(steplist)/sizeof(steplist[0])){
-				sprintf(data.buf,"failed:cmd error");
+		int i;
+		int pos = 0;
+		for(i=0;i<io_val.maxfds;i++){
+			if(FD_ISSET(i,&_rfds)){
+				fdsbuf[pos] = i;
+				pos++;
 			}
-			else{
-				steplist[num](&data);
-			}
-			send_data(cfd,&data,sizeof(data_t));
+		}
+		for(i=0;i<pos;i++){
+			cfd = fdsbuf[i];
+			if(io_val.proc_ptr[cfd])io_val.proc_ptr[cfd](cfd,&io_val);
+			else printf("%d proc_ptr null\n",cfd);
 		}
 	}
 	return 0;
+}
+
+void accept_process(int fd,void *d){
+	io_val_t *io_val = d;
+	int cfd;
+	struct sockaddr_in cli_addr;
+	int addrlen = sizeof(struct sockaddr_in);
+	if((cfd = accept(fd,(struct sockaddr *)&cli_addr,&addrlen)) < 0){
+		perror("accept error");
+		exit(-1);
+	}
+	printf("client connect info : %s  %d\n",inet_ntoa(cli_addr.sin_addr),ntohs(cli_addr.sin_port));
+	if(io_val->maxfds <= cfd) io_val->maxfds = cfd+1;
+	FD_SET(cfd,&io_val->rfds);
+	io_val->proc_ptr[cfd] = client_process;
+}
+
+void client_process(int fd,void *d){
+	io_val_t *io_val = d;
+	data_t data;
+	memset(&data,0,sizeof(data_t));
+	step_ptr steplist[6] = {step_register,step_login,step_cancel,step_dictory,step_history,step_quit};
+	if(recv_data(fd,&data,sizeof(data_t)) < 0){
+		FD_CLR(fd,&io_val->rfds);
+		return;
+	}
+	int num = confirm_cmd(data.cmd);
+	if(num < 0 || num >= sizeof(steplist)/sizeof(steplist[0])){
+		sprintf(data.buf,"failed:cmd error");
+	}
+	else{
+		steplist[num](&data);
+	}
+	send_data(fd,&data,sizeof(data_t));
 }
 
 int step_register(data_t *data){
@@ -87,7 +138,7 @@ int step_register(data_t *data){
 		sprintf(data->buf,"failed:database error");
 		return -1;
 	}
-//´´½¨¸öÈËÀúÊ·²éÑ¯±í
+//åˆ›å»ºä¸ªäººå†å²æŸ¥è¯¢è¡¨
 	memset(sqlbuf,0,sizeof(sqlbuf));
 	sprintf(sqlbuf,"create table if not exists %s_history(word txt not null);",data->name);
 	if(database_exec("test.db",sqlbuf) < 0){
@@ -161,13 +212,19 @@ int step_dictory(data_t *data){
 	memcpy(data->buf,revbuf,len-1);
 	data->buf[len-1] = '\0';
 	free(revbuf);
-//±£´æ²éÑ¯µÄµ¥´Ê
+//ä¿å­˜æŸ¥è¯¢çš„å•è¯
 	memset(sqlbuf,0,sizeof(sqlbuf));
-	sprintf(sqlbuf,"insert into %s_history(word) values(\"%s\");",data->name,data->word);
-	if(database_exec("test.db",sqlbuf) < 0){
-		sprintf(data->buf,"failed:database error");
-		return -1;
+	sprintf(sqlbuf,"select * from %s_history where word=\"%s\";",data->name,data->word);
+	revbuf = database_get_table("test.db",sqlbuf);
+	if(!revbuf){
+		memset(sqlbuf,0,sizeof(sqlbuf));
+		sprintf(sqlbuf,"insert into %s_history(word) values(\"%s\");",data->name,data->word);
+		if(database_exec("test.db",sqlbuf) < 0){
+			sprintf(data->buf,"failed:database error");
+			return -1;
+		}	
 	}
+	free(revbuf);
 	return 0;
 }
 
@@ -176,7 +233,7 @@ int step_history(data_t *data){
 	sprintf(sqlbuf,"select * from %s_history;",data->name);
 	char *revbuf = database_get_table("test.db",sqlbuf);
 	if(!revbuf){
-		sprintf(data->buf,"failed:%s history not exist",data->name);
+		sprintf(data->buf,"failed:%s history not data",data->name);
 		return -1;
 	}
 	int len = sizeof(data->buf);
@@ -200,7 +257,7 @@ int confirm_cmd(char *cmd){
 	return -1;
 }
 
-//ÊÕ·¢ĞÅÏ¢
+//æ”¶å‘ä¿¡æ¯
 int send_data(int fd,data_t *data,int len){
 	if(fd < 0 || !data){
 		fprintf(stderr,"send_data : input error\n");
@@ -237,7 +294,7 @@ int recv_data(int fd,data_t *data,int len){
 	return 0;
 }
 
-//Êı¾İ¿â²Ù×÷
+//æ•°æ®åº“æ“ä½œ
 int database_exec(char *dbname,char *sqlbuf){
 	sqlite3 *db = NULL;
 	if(sqlite3_open(dbname,&db) != SQLITE_OK){
